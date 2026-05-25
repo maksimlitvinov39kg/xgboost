@@ -33,6 +33,10 @@ double GPUMultiClassROCAUC(Context const *ctx, common::Span<float const> predts,
                            MetaInfo const &info, std::shared_ptr<DeviceAUCCache> *p_cache,
                            std::size_t n_classes);
 
+double GPUMultiLabelROCAUC(Context const *ctx, common::Span<float const> predts,
+                           MetaInfo const &info, std::shared_ptr<DeviceAUCCache> *p_cache,
+                           std::size_t n_targets);
+
 std::pair<double, std::uint32_t> GPURankingAUC(Context const *ctx, common::Span<float const> predts,
                                                MetaInfo const &info,
                                                std::shared_ptr<DeviceAUCCache> *cache);
@@ -48,6 +52,10 @@ std::tuple<double, double, double> GPUBinaryPRAUC(Context const *ctx,
 double GPUMultiClassPRAUC(Context const *ctx, common::Span<float const> predts,
                           MetaInfo const &info, std::shared_ptr<DeviceAUCCache> *p_cache,
                           std::size_t n_classes);
+
+double GPUMultiLabelPRAUC(Context const *ctx, common::Span<float const> predts,
+                          MetaInfo const &info, std::shared_ptr<DeviceAUCCache> *p_cache,
+                          std::size_t n_targets);
 
 std::pair<double, std::uint32_t> GPURankingPRAUC(Context const *ctx,
                                                  common::Span<float const> predts,

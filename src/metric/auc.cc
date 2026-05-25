@@ -137,6 +137,59 @@ double MultiClassOVR(Context const *ctx, common::Span<float const> predts, MetaI
   return auc_sum;
 }
 
+template <typename BinaryAUC>
+double MultiLabelOVR(Context const *ctx, common::Span<float const> predts, MetaInfo const &info,
+                     size_t n_targets, int32_t n_threads, BinaryAUC &&binary_auc) {
+  CHECK_NE(n_targets, 0);
+  auto const labels = info.labels.HostView();
+  CHECK_EQ(labels.Shape(1), n_targets);
+
+  std::vector<double> results_storage(n_targets * 3, 0);
+  auto results = linalg::MakeTensorView(ctx, results_storage, n_targets, 3);
+  auto local_area = results.Slice(linalg::All(), 0);
+  auto tp = results.Slice(linalg::All(), 1);
+  auto auc = results.Slice(linalg::All(), 2);
+
+  auto weights = common::OptionalWeights{info.weights_.ConstHostSpan()};
+  auto predts_t = linalg::MakeTensorView(ctx, predts, info.num_row_, n_targets);
+
+  if (info.labels.Size() != 0) {
+    common::ParallelFor(n_targets, n_threads, [&](auto target_id) {
+      std::vector<float> proba(info.num_row_);
+      std::vector<float> response(info.num_row_);
+      for (size_t i = 0; i < info.num_row_; ++i) {
+        proba[i] = predts_t(i, target_id);
+        response[i] = labels(i, target_id);
+      }
+      double fp;
+      std::tie(fp, tp(target_id), auc(target_id)) = binary_auc(
+          ctx, proba, linalg::MakeVec(response.data(), response.size(), ctx->Device()), weights);
+      local_area(target_id) = fp * tp(target_id);
+    });
+  }
+
+  auto rc = collective::GlobalSum(ctx, info, results);
+  collective::SafeColl(rc);
+
+  double auc_sum{0};
+  double tp_sum{0};
+  for (size_t t = 0; t < n_targets; ++t) {
+    if (local_area(t) != 0) {
+      auc_sum += auc(t) / local_area(t) * tp(t);
+      tp_sum += tp(t);
+    } else {
+      auc_sum = std::numeric_limits<double>::quiet_NaN();
+      break;
+    }
+  }
+  if (tp_sum == 0 || std::isnan(auc_sum)) {
+    auc_sum = std::numeric_limits<double>::quiet_NaN();
+  } else {
+    auc_sum /= tp_sum;
+  }
+  return auc_sum;
+}
+
 std::tuple<double, double, double> BinaryROCAUC(Context const *ctx,
                                                 common::Span<float const> predts,
                                                 linalg::VectorView<float const> labels,
@@ -298,6 +351,13 @@ class EvalAUC : public MetricNoCache {
         CHECK_LE(auc, 1.0 + kRtEps) << "Total AUC across groups: " << auc * valid_groups
                                     << ", valid groups: " << valid_groups;
       }
+    } else if (info.labels.Shape(1) > 1) {
+      /**
+       * multi-label
+       */
+      size_t n_targets = info.labels.Shape(1);
+      CHECK_EQ(preds.Size(), info.labels.Size());
+      auc = static_cast<Curve *>(this)->EvalMultiLabel(preds, info, n_targets);
     } else if (meta[0] != meta[1] && meta[1] % meta[0] == 0) {
       /**
        * multi class
@@ -325,6 +385,10 @@ class EvalAUC : public MetricNoCache {
     }
     return auc;
   }
+
+ public:
+  virtual double EvalMultiLabel(HostDeviceVector<float> const &predts,
+                                MetaInfo const &info, size_t n_targets) = 0;
 };
 
 class EvalROCAUC : public EvalAUC<EvalROCAUC> {
@@ -355,6 +419,19 @@ class EvalROCAUC : public EvalAUC<EvalROCAUC> {
       auc = GPUMultiClassROCAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_, n_classes);
     } else {
       auc = MultiClassOVR(ctx_, predts.ConstHostVector(), info, n_classes, n_threads, BinaryROCAUC);
+    }
+    return auc;
+  }
+
+  double EvalMultiLabel(HostDeviceVector<float> const &predts,
+                        MetaInfo const &info, size_t n_targets) override {
+    double auc{0};
+    auto n_threads = ctx_->Threads();
+    CHECK_NE(n_targets, 0);
+    if (ctx_->IsCUDA()) {
+      auc = GPUMultiLabelROCAUC(ctx_, predts.ConstDeviceSpan(), info, &this->d_cache_, n_targets);
+    } else {
+      auc = MultiLabelOVR(ctx_, predts.ConstHostVector(), info, n_targets, n_threads, BinaryROCAUC);
     }
     return auc;
   }
@@ -397,6 +474,12 @@ double GPUMultiClassROCAUC(Context const *, common::Span<float const>, MetaInfo 
   return 0.0;
 }
 
+double GPUMultiLabelROCAUC(Context const *, common::Span<float const>, MetaInfo const &,
+                           std::shared_ptr<DeviceAUCCache> *, std::size_t) {
+  common::AssertGPUSupport();
+  return 0.0;
+}
+
 std::pair<double, std::uint32_t> GPURankingAUC(Context const *, common::Span<float const>,
                                                MetaInfo const &,
                                                std::shared_ptr<DeviceAUCCache> *) {
@@ -430,6 +513,16 @@ class EvalPRAUC : public EvalAUC<EvalPRAUC> {
     } else {
       auto n_threads = this->ctx_->Threads();
       return MultiClassOVR(ctx_, predts.ConstHostSpan(), info, n_classes, n_threads, BinaryPRAUC);
+    }
+  }
+
+  double EvalMultiLabel(HostDeviceVector<float> const &predts,
+                        MetaInfo const &info, size_t n_targets) override {
+    if (ctx_->IsCUDA()) {
+      return GPUMultiLabelPRAUC(ctx_, predts.ConstDeviceSpan(), info, &d_cache_, n_targets);
+    } else {
+      auto n_threads = this->ctx_->Threads();
+      return MultiLabelOVR(ctx_, predts.ConstHostSpan(), info, n_targets, n_threads, BinaryPRAUC);
     }
   }
 
@@ -469,6 +562,12 @@ std::tuple<double, double, double> GPUBinaryPRAUC(Context const *, common::Span<
 }
 
 double GPUMultiClassPRAUC(Context const *, common::Span<float const>, MetaInfo const &,
+                          std::shared_ptr<DeviceAUCCache> *, std::size_t) {
+  common::AssertGPUSupport();
+  return {};
+}
+
+double GPUMultiLabelPRAUC(Context const *, common::Span<float const>, MetaInfo const &,
                           std::shared_ptr<DeviceAUCCache> *, std::size_t) {
   common::AssertGPUSupport();
   return {};

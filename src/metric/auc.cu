@@ -434,6 +434,109 @@ double GPUMultiClassAUCOVR(Context const *ctx, MetaInfo const &info,
   return ScaleClasses(ctx, info.IsColumnSplit(), d_results, local_area, tp, auc, n_classes);
 }
 
+template <bool scale, typename Fn>
+double GPUMultiLabelAUC(Context const *ctx, MetaInfo const &info,
+                        common::Span<uint32_t> d_target_ptr, size_t n_targets,
+                        std::shared_ptr<DeviceAUCCache> cache, Fn area_fn) {
+  dh::safe_cuda(cudaSetDevice(ctx->Ordinal()));
+
+  auto d_predts_t = dh::ToSpan(cache->predts_t);
+  auto d_sorted_idx = dh::ToSpan(cache->sorted_idx);
+
+  auto labels = info.labels.View(ctx->Device());
+  auto weights = info.weights_.ConstDeviceSpan();
+
+  size_t n_samples = labels.Shape(0);
+
+  if (n_samples == 0) {
+    dh::TemporaryArray<double> resutls(n_targets * 4, 0.0f);
+    auto d_results = dh::ToSpan(resutls);
+    dh::LaunchN(n_targets * 4, [=] XGBOOST_DEVICE(size_t i) { d_results[i] = 0.0f; });
+    auto local_area = d_results.subspan(0, n_targets);
+    auto tp = d_results.subspan(2 * n_targets, n_targets);
+    auto auc = d_results.subspan(3 * n_targets, n_targets);
+    return ScaleClasses(ctx, info.IsColumnSplit(), d_results, local_area, tp, auc, n_targets);
+  }
+
+  dh::caching_device_vector<double> d_auc(n_targets, 0);
+  auto get_weight = common::OptionalWeights{weights};
+  auto d_fptp = dh::ToSpan(cache->fptp);
+  auto get_fp_tp = [=] XGBOOST_DEVICE(size_t i) {
+    size_t idx = d_sorted_idx[i];
+
+    size_t target_id = i / n_samples;
+    float label = labels(idx % n_samples, target_id);
+
+    float w = get_weight[d_sorted_idx[i] % n_samples];
+    float fp = (1.0 - label) * w;
+    float tp = label * w;
+    return cuda::std::make_pair(fp, tp);
+  };  // NOLINT
+  dh::LaunchN(d_sorted_idx.size(), [=] XGBOOST_DEVICE(size_t i) { d_fptp[i] = get_fp_tp(i); });
+
+  auto d_unique_idx = dh::ToSpan(cache->unique_idx);
+  dh::Iota(d_unique_idx, ctx->CUDACtx()->Stream());
+  auto uni_key = dh::MakeTransformIterator<cuda::std::pair<std::uint32_t, float>>(
+      thrust::make_counting_iterator(0), [=] XGBOOST_DEVICE(size_t i) {
+        uint32_t target_id = i / n_samples;
+        float predt = d_predts_t[d_sorted_idx[i]];
+        return cuda::std::make_pair(target_id, predt);
+      });
+
+  dh::TemporaryArray<uint32_t> unique_target_ptr(d_target_ptr.size());
+  auto d_unique_target_ptr = dh::ToSpan(unique_target_ptr);
+  auto n_uniques = dh::SegmentedUniqueByKey(
+      ctx->CUDACtx()->TP(), dh::tbegin(d_target_ptr), dh::tend(d_target_ptr), uni_key,
+      uni_key + d_sorted_idx.size(), dh::tbegin(d_unique_idx), d_unique_target_ptr.data(),
+      dh::tbegin(d_unique_idx), std::equal_to<cuda::std::pair<uint32_t, float>>{});
+  d_unique_idx = d_unique_idx.subspan(0, n_uniques);
+
+  auto get_target_id = [=] XGBOOST_DEVICE(size_t idx) {
+    return idx / n_samples;
+  };
+  SegmentedFPTP(ctx, d_fptp, get_target_id);
+
+  auto d_neg_pos = dh::ToSpan(cache->neg_pos);
+  dh::LaunchN(d_unique_idx.size(), ctx->CUDACtx()->Stream(), [=] XGBOOST_DEVICE(size_t i) {
+    if (d_unique_idx[i] % n_samples == 0) {
+      d_neg_pos[d_unique_idx[i]] = {0, 0};
+      return;
+    }
+    uint32_t target_id = d_unique_idx[i] / n_samples;
+    d_neg_pos[d_unique_idx[i]] = d_fptp[d_unique_idx[i] - 1];
+    if (i == common::LastOf(target_id, d_unique_target_ptr)) {
+      size_t last = d_unique_idx[common::LastOf(target_id, d_unique_target_ptr)];
+      d_neg_pos[common::LastOf(target_id, d_target_ptr)] = d_fptp[last - 1];
+      return;
+    }
+  });
+
+  auto s_d_auc = dh::ToSpan(d_auc);
+  SegmentedReduceAUC(ctx, d_unique_idx, d_target_ptr, d_unique_target_ptr, cache, area_fn,
+                     get_target_id, s_d_auc);
+
+  dh::TemporaryArray<double> resutls(n_targets * 4);
+  auto d_results = dh::ToSpan(resutls);
+  auto local_area = d_results.subspan(0, n_targets);
+  auto fp = d_results.subspan(n_targets, n_targets);
+  auto tp = d_results.subspan(2 * n_targets, n_targets);
+  auto auc = d_results.subspan(3 * n_targets, n_targets);
+
+  dh::LaunchN(n_targets, ctx->CUDACtx()->Stream(), [=] XGBOOST_DEVICE(size_t t) {
+    auc[t] = s_d_auc[t];
+    auto last = d_fptp[n_samples * t + (n_samples - 1)];
+    fp[t] = last.first;
+    if (scale) {
+      local_area[t] = last.first * last.second;
+      tp[t] = last.second;
+    } else {
+      local_area[t] = 1.0f;
+      tp[t] = 1.0f;
+    }
+  });
+  return ScaleClasses(ctx, info.IsColumnSplit(), d_results, local_area, tp, auc, n_targets);
+}
+
 void MultiClassSortedIdx(Context const *ctx, common::Span<float const> predts,
                          common::Span<uint32_t> d_class_ptr,
                          std::shared_ptr<DeviceAUCCache> cache) {
@@ -467,6 +570,38 @@ double GPUMultiClassROCAUC(Context const *ctx, common::Span<float const> predts,
     return TrapezoidArea(fp_prev, fp, tp_prev, tp);
   };
   return GPUMultiClassAUCOVR<true>(ctx, info, dh::ToSpan(class_ptr), n_classes, cache, fn);
+}
+
+void MultiLabelSortedIdx(Context const *ctx, common::Span<float const> predts,
+                         common::Span<uint32_t> d_target_ptr,
+                         std::shared_ptr<DeviceAUCCache> cache) {
+  size_t n_targets = d_target_ptr.size() - 1;
+  auto d_predts_t = dh::ToSpan(cache->predts_t);
+  auto n_samples = d_predts_t.size() / n_targets;
+  if (n_samples == 0) {
+    return;
+  }
+  Transpose(predts, d_predts_t, n_samples, n_targets);
+  dh::LaunchN(n_targets + 1, ctx->CUDACtx()->Stream(),
+              [=] XGBOOST_DEVICE(size_t i) { d_target_ptr[i] = i * n_samples; });
+  auto d_sorted_idx = dh::ToSpan(cache->sorted_idx);
+  common::SegmentedArgSort<false, false>(ctx, d_predts_t, d_target_ptr, d_sorted_idx);
+}
+
+double GPUMultiLabelROCAUC(Context const *ctx, common::Span<float const> predts,
+                           MetaInfo const &info, std::shared_ptr<DeviceAUCCache> *p_cache,
+                           std::size_t n_targets) {
+  auto &cache = *p_cache;
+  InitCacheOnce<true>(predts, p_cache);
+
+  dh::TemporaryArray<uint32_t> target_ptr(n_targets + 1, 0);
+  MultiLabelSortedIdx(ctx, predts, dh::ToSpan(target_ptr), cache);
+
+  auto fn = [] XGBOOST_DEVICE(double fp_prev, double fp, double tp_prev, double tp,
+                              size_t /*target_id*/) {
+    return TrapezoidArea(fp_prev, fp, tp_prev, tp);
+  };
+  return GPUMultiLabelAUC<true>(ctx, info, dh::ToSpan(target_ptr), n_targets, cache, fn);
 }
 
 namespace {
@@ -679,6 +814,47 @@ double GPUMultiClassPRAUC(Context const *ctx, common::Span<float const> predts,
     return detail::CalcDeltaPRAUC(fp_prev, fp, tp_prev, tp, d_totals[class_id].first);
   };
   return GPUMultiClassAUCOVR<false>(ctx, info, d_class_ptr, n_classes, cache, fn);
+}
+
+double GPUMultiLabelPRAUC(Context const *ctx, common::Span<float const> predts,
+                          MetaInfo const &info, std::shared_ptr<DeviceAUCCache> *p_cache,
+                          std::size_t n_targets) {
+  auto &cache = *p_cache;
+  InitCacheOnce<true>(predts, p_cache);
+
+  dh::TemporaryArray<uint32_t> target_ptr(n_targets + 1, 0);
+  MultiLabelSortedIdx(ctx, predts, dh::ToSpan(target_ptr), cache);
+  auto d_sorted_idx = dh::ToSpan(cache->sorted_idx);
+
+  auto d_weights = info.weights_.ConstDeviceSpan();
+  auto labels = info.labels.View(ctx->Device());
+  auto n_samples = info.num_row_;
+
+  dh::caching_device_vector<Pair> totals(n_targets);
+  auto key_it = dh::MakeTransformIterator<size_t>(
+      thrust::make_counting_iterator(0ul),
+      [n_samples] XGBOOST_DEVICE(size_t i) {
+        return i / n_samples;
+      });
+  auto get_weight = common::OptionalWeights{d_weights};
+  auto val_it = dh::MakeTransformIterator<cuda::std::pair<double, double>>(
+      thrust::make_counting_iterator(0ul), [=] XGBOOST_DEVICE(size_t i) {
+        auto idx = d_sorted_idx[i] % n_samples;
+        auto w = get_weight[idx];
+        auto target_id = i / n_samples;
+        auto y = labels(idx, target_id);
+        return cuda::std::make_pair(y * w, (1.0f - y) * w);
+      });
+  thrust::reduce_by_key(ctx->CUDACtx()->CTP(), key_it, key_it + predts.size(), val_it,
+                        thrust::make_discard_iterator(), totals.begin(), thrust::equal_to<size_t>{},
+                        PairPlus<double, double>{});
+
+  auto d_totals = dh::ToSpan(totals);
+  auto fn = [d_totals] XGBOOST_DEVICE(double fp_prev, double fp, double tp_prev, double tp,
+                                      size_t target_id) {
+    return detail::CalcDeltaPRAUC(fp_prev, fp, tp_prev, tp, d_totals[target_id].first);
+  };
+  return GPUMultiLabelAUC<false>(ctx, info, dh::ToSpan(target_ptr), n_targets, cache, fn);
 }
 
 template <typename Fn>
